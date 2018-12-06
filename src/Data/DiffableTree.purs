@@ -19,20 +19,27 @@ import Control.Monad.ST.Ref as ST.Ref
 import Data.Array as Array
 import Data.Array.ST (STArray)
 import Data.Array.ST as Array.ST
+import Data.Foldable (for_)
+import Data.Function (on)
 import Data.List (List)
 import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe, fromJust)
+import Data.Ord.Down (Down(..))
 import Data.Profunctor.Strong (first, second)
 import Data.Traversable (traverse)
-import Data.Tuple (Tuple(..), snd)
+import Data.Tuple (Tuple(..), fst, snd, uncurry)
 import Partial.Unsafe (unsafePartial)
+
+paramF :: Number
+paramF = 1.0
+
+paramT :: Number
+paramT = 0.5
 
 withMaybe :: forall a. a -> (a -> Maybe a) -> a
 withMaybe x f = fromMaybe x (f x)
-
--- TODO: how to handle missing node ids?
 
 -- Based on the type in purescript-graphs. A graph whose vertices are labelled
 -- by keys of type `k` and have values at each vertex of type `v`. Each vertex
@@ -64,42 +71,53 @@ type Node a =
 
 -- | Traverse a tree top-down, in a breadth-first order. We use an STRef for
 -- | the tree, and the traversal is specialised to the ST monad, so that the
--- | tree can be modified during the traversal if necessary.
+-- | tree can be modified during the traversal if necessary. The function
+-- | argument is called once for each node, receiving the current depth
+-- | (starting from 0 for the root) as well as the node's id.
+-- |
+-- | Inserting, deleting, or moving nodes during the traversal may result in
+-- | unexpected behaviour, such as certain nodes being visited twice or not at
+-- | all.
 traverseTopDown :: forall r a.
-  (NodeId -> ST r Unit) -> STRef r (DiffableTree a) -> ST r Unit
+  (Int -> NodeId -> ST r Unit) -> STRef r (DiffableTree a) -> ST r Unit
 traverseTopDown visit treeRef = do
   queue <- Array.ST.empty
   DiffableTree rootId _ _ <- ST.Ref.read treeRef
-  push rootId queue
+  push (Tuple 0 rootId) queue
 
   ST.while (not <$> isEmpty queue) do
-    id <- unsafePartial (fromJust <$> pop queue)
+    Tuple depth id <- unsafePartial (fromJust <$> pop queue)
+    visit depth id
     DiffableTree _ tree _ <- ST.Ref.read treeRef
-    visit id
     let children = maybe [] snd (Map.lookup id tree)
-    Array.ST.pushAll children queue
+    Array.ST.pushAll (map (Tuple (depth+1)) children) queue
 
   where
   isEmpty = map (_ == Nothing) <<< Array.ST.peek 0
 
 -- | Traverse a tree bottom-up and left-to-right (breadth-first). We use an
 -- | STRef and the ST monad so that the tree can be modified during the
--- | traversal.
--- traverseBottomUp :: forall r a.
---   (NodeId -> Diff r Unit) -> STRef r (DiffableTree a) -> Diff r Unit
--- traverseBottomUp f ref = do
---   queue <- Array.ST.empty
---   DiffableTree rootId _ _ <- ST.read ref
---   push rootId queue
---   go queue
--- 
---   where
---   go queue = do
---     mitem <- pop queue
---     for_ mitem \item -> do
---       f item
---       tree <- ST.read ref
+-- | traversal if necessary. The function argument is called once for each
+-- | node, receiving the current depth (starting from 0 for the root) as well
+-- | as the node's id.
+-- |
+-- | Inserting, deleting, or moving nodes during the traversal may result in
+-- | unexpected behaviour in general, such as certain nodes being visited twice
+-- | or not at all. However if, during the traversal, the current node is a
+-- | leaf, it *can* be safely deleted.
+traverseBottomUp :: forall r a.
+  (Int -> NodeId -> ST r Unit) -> STRef r (DiffableTree a) -> ST r Unit
+traverseBottomUp visit treeRef = do
+  visitOrder <- computeVisitOrder
+  for_ visitOrder (uncurry visit)
 
+  where
+  computeVisitOrder :: ST r (Array (Tuple Int NodeId))
+  computeVisitOrder = do
+    xs <- Array.ST.empty
+    flip traverseTopDown treeRef \depth id -> push (Tuple depth id) xs
+    xs' <- Array.ST.unsafeFreeze xs
+    pure (stableSortBy (flip compare `on` fst) xs')
 
 push :: forall r a. a -> STArray r a -> ST r Unit
 push value = void <<< Array.ST.push value
@@ -109,6 +127,20 @@ pop = arraySTPopImpl Just Nothing
 
 foreign import arraySTPopImpl :: forall h a. (a -> Maybe a) -> Maybe a -> STArray h a -> ST h (Maybe a)
 
+-- | Perform a guaranteed-stable sort of an Array (note that
+-- | `Data.Array.sort` is not guaranteed to be stable).
+stableSortBy :: forall a. Ord a => (a -> a -> Ordering) -> Array a -> Array a
+stableSortBy f =
+  map snd <<< Array.sortBy comp <<< Array.mapWithIndex Tuple
+  where
+  comp :: Tuple Int a -> Tuple Int a -> Ordering
+  comp (Tuple i x) (Tuple j y) =
+    case f x y of
+      EQ ->
+        compare i j
+      other ->
+        other
+
 -- | A matching of nodes in two different trees; used in the diffing algorithm.
 newtype Matching
   = Matching (Map NodeId NodeId)
@@ -116,14 +148,34 @@ newtype Matching
 emptyMatching :: Matching
 emptyMatching = Matching Map.empty
 
--- | Insert a symmetrical match; subsequent lookups of either node id will each
--- | return the other. The matching must not already contain either node id.
+-- | Insert a match symmetrically; subsequent lookups of either node id will
+-- | each return the other. The matching must not already contain either node
+-- | id.
 insertMatch :: NodeId -> NodeId -> Matching -> Matching
 insertMatch x y (Matching map) =
   Matching (Map.insert x y (Map.insert y x map))
 
--- match :: forall a. DiffableTree a -> DiffableTree a -> Matching
--- match t1' t2' = ?todo
+-- | Scan two diffable trees to produce a partial matching. The trees must not
+-- | have overlapping node ids.
+match :: forall a. Comparison a -> DiffableTree a -> DiffableTree a -> Matching
+match t1 t2 = ST.run do
+  m <- ST.Ref.new emptyMatching
+
+  -- Mark all nodes of each tree 'unmatched'. We use a regular Array for the
+  -- nodes of t1, since we will be matching them in bottom-up traversal order.
+  -- We use an STArray for the nodes of t2, since we may match them
+  -- out of order.
+  unmatchedT1 <- ST.Array.unsafeThaw (allNodesBottomUp t1)
+  unmatchedT2 <- allNodesBottomUp t2
+
+  ST.Ref.read m
+
+  where
+  allNodesBottomUp tree = do
+     nodes <- ST.Array.empty
+     traverseBottomUp (\_ id -> { id, isLeaf: isLeaf id }) 
+
+  go m = ?todo
 
 -- | The function `insertLeafNode childId value k parentId` inserts a new leaf
 -- | node with id `childId` and value `value` as the `k`th child of the node
